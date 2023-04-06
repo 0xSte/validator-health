@@ -2,103 +2,169 @@ package main
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/csv"
 	"fmt"
 	"log"
 	"net/http"
+	"os"
+	"strconv"
+	"time"
 
-	"validator-stats/pkg/beacon"
+	"github.com/0xste/validator-stats/internal/validator"
+	"github.com/0xste/validator-stats/pkg/beacon"
+	"github.com/0xste/validator-stats/pkg/prom"
+	"github.com/pkg/errors"
+	"github.com/spf13/viper"
+	"gopkg.in/yaml.v2"
 )
 
+var (
+	// common config
+	configOutFile   = "OUT_FILE"
+	configInfoFile  = "INFO_FILE"
+	configTimeRange = "TIME_RANGE"
+	configMode      = "RUN_MODE"
+
+	// mode == file
+	configFile = "CONFIG_FILE"
+
+	// mode == prom
+	configPromUser     = "PROM_USER"
+	configPromPassword = "PROM_PASSWORD"
+	configPromEndpoint = "PROM_ENDPOINT"
+)
+
+func init() {
+	viper.SetDefault(configMode, "prom") // or "prom"
+	viper.SetDefault(configFile, "./pubkeys.yml")
+	viper.SetDefault(configOutFile, "./out.csv")
+	viper.SetDefault(configInfoFile, "./info.csv")
+	viper.SetDefault(configTimeRange, time.Hour*24*90)
+}
+
 func main() {
+	processStart := time.Now()
 
-	// read in from file
-	pubkey := "0x8d49260f56c41cb36d2a9efb4033b4249b98138fd50968f9338d55302266f117007ae3a043f3ffa5fc1a9344dc1c0e35"
-
-	client := beacon.NewClient(http.DefaultClient)
-
-	pkErrors, err := getValidatorhealth(client, pubkey)
+	viper.AutomaticEnv()
+	file, err := os.ReadFile(viper.GetString(configFile))
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	str, _ := json.MarshalIndent(pkErrors, "", "  ")
-	fmt.Println(string(str))
+	var promClient *prom.Client
+	var pubkeys []string
+	switch viper.GetString(configMode) {
+	case "file":
+		if viper.GetString(configFile) == "" {
+			log.Fatal("missing file config")
+		}
+		if err := yaml.Unmarshal(file, &pubkeys); err != nil {
+			log.Fatal(err)
+		}
+	case "prom":
+		if viper.GetString(configPromEndpoint) == "" || viper.GetString(configPromUser) == "" || viper.GetString(configPromPassword) == "" {
+			log.Fatal("missing prom config")
+		}
+		promClient, err = prom.New(
+			prom.WithAddress(viper.GetString(configPromEndpoint)),
+			prom.WithBasicAuth(viper.GetString(configPromUser), viper.GetString(configPromPassword)),
+		)
+		if err != nil {
+			log.Fatal(err)
+		}
+		pubkeys, err = promClient.GetValidatorPubkeys(context.Background())
+		if err != nil {
+			log.Fatal(err)
+		}
+	}
+	log.Printf("there are %d validators to check\n", len(pubkeys))
+
+	beaconClient := beacon.NewClient(http.DefaultClient, "", 0, 0)
+
+	client := validator.NewClient(beaconClient, promClient)
+	if err := run(client, pubkeys, processStart); err != nil {
+		log.Fatal(err)
+	}
 }
 
-type Validatorhealth struct {
-	Info       beacon.Validator
-	Conditions map[string][]Condition
+func run(client *validator.Client, pubkeys []string, processStart time.Time) error {
+	start := time.Now()
+	log.Printf("retrieving pubkeys took %s\n", time.Since(processStart))
+
+	client.GetEstimatedDuration(len(pubkeys))
+
+	err := writeValidators(client, pubkeys)
+	log.Printf("write took %s\n", time.Since(start))
+	return err
 }
 
-func getValidatorhealth(client *beacon.Client, pubkey string) (*Validatorhealth, error) {
-	validator, err := client.GetValidator(context.Background(), pubkey)
+func writeValidators(client *validator.Client, pubkeys []string) error {
+	// manage outfile
+	outFile, err := os.Create(viper.GetString(configOutFile))
 	if err != nil {
-		return nil, err
+		return errors.Wrap(err, "failed to create out file")
 	}
+	defer outFile.Close()
+	outWriter := csv.NewWriter(outFile)
+	defer outWriter.Flush()
 
-	stats, err := client.GetValidatorStats(context.Background(), 90, validator.Data.Validatorindex)
+	// write headers
+	err = outWriter.Write([]string{"pubkey", "issue_type", "count", "timestamp", "status", "withdrawal_credentials"})
 	if err != nil {
-		return nil, err
+		return err
 	}
+	outWriter.Flush()
 
-	pkErrors := make(map[string][]Condition)
-
-	for _, stat := range stats.Data {
-		if stat.MissedBlocks != 0 {
-			pkErrors[validator.Data.Pubkey] = append(pkErrors[validator.Data.Pubkey], Condition{
-				Day:       stat.DayEnd,
-				Count:     stat.MissedBlocks,
-				IssueType: missedBlock,
-			})
-		}
-		if stat.MissedSync != 0 {
-			pkErrors[validator.Data.Pubkey] = append(pkErrors[validator.Data.Pubkey], Condition{
-				Day:       stat.DayEnd,
-				Count:     stat.MissedSync,
-				IssueType: missedSync,
-			})
-		}
-		if stat.MissedAttestations != 0 {
-			pkErrors[validator.Data.Pubkey] = append(pkErrors[validator.Data.Pubkey], Condition{
-				Day:       stat.DayEnd,
-				Count:     stat.MissedAttestations,
-				IssueType: missedAttestation,
-			})
-		}
-		if stat.ProposerSlashings != 0 {
-			pkErrors[validator.Data.Pubkey] = append(pkErrors[validator.Data.Pubkey], Condition{
-				Day:       stat.DayEnd,
-				Count:     stat.ProposerSlashings,
-				IssueType: slashingProposer,
-			})
-		}
-		if stat.AttesterSlashings != 0 {
-			pkErrors[validator.Data.Pubkey] = append(pkErrors[validator.Data.Pubkey], Condition{
-				Day:       stat.DayEnd,
-				Count:     stat.AttesterSlashings,
-				IssueType: slashingAttester,
-			})
-		}
+	// manage info file
+	infoFile, err := os.Create(viper.GetString(configInfoFile))
+	if err != nil {
+		return errors.Wrap(err, "failed to create info file")
 	}
-	return &Validatorhealth{
-		Info:       *validator,
-		Conditions: pkErrors,
-	}, nil
-}
+	defer infoFile.Close()
+	infoWriter := csv.NewWriter(infoFile)
+	defer infoWriter.Flush()
+	err = infoWriter.Write([]string{"pubkey", "status", "withdrawal", "slashed", "name", "index", "timestamp"})
+	if err != nil {
+		return err
+	}
+	infoWriter.Flush()
 
-type IssueType string
+	// make a request and immediately write to file
+	lookback := -viper.GetDuration(configTimeRange)
+	for _, pubkey := range pubkeys {
+		var lines [][]string
+		health, err := client.GetValidatorHealth(pubkey, lookback)
+		if err != nil {
+			log.Printf("skipping %s\n", pubkey)
+			continue
+		}
+		info := health.Info.Data
 
-const (
-	missedBlock       IssueType = "missed_block"
-	missedAttestation IssueType = "missed_attestation"
-	missedSync        IssueType = "missed_sync"
-	slashingAttester  IssueType = "slashing_attester"
-	slashingProposer  IssueType = "slashing_propoer"
-)
+		err = infoWriter.Write([]string{info.Pubkey, info.Status, info.Withdrawalcredentials, strconv.FormatBool(info.Slashed), info.Name, strconv.Itoa(info.Validatorindex), time.Now().String()})
+		if err != nil {
+			return err
+		}
+		infoWriter.Flush()
 
-type Condition struct {
-	Day       string
-	Count     int
-	IssueType IssueType
+		// write health conditions file
+		for _, conditions := range health.Conditions {
+			for _, condition := range conditions {
+				lines = append(lines, []string{
+					health.Info.Data.Pubkey,
+					string(condition.IssueType),
+					fmt.Sprintf("%d",
+						condition.Count,
+					), condition.Day.String(),
+					health.Info.Data.Status,
+					health.Info.Data.Withdrawalcredentials,
+				})
+			}
+			if err := outWriter.WriteAll(lines); err != nil {
+				return errors.Wrap(err, "error writing record to file")
+			}
+
+		}
+
+	}
+	return nil
 }
